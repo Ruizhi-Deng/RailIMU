@@ -13,7 +13,7 @@ object CsvLogger {
         gUsed: Double,
         p: RailEstimator.Parameters
     ): File {
-        val file = File.createTempFile("railimu_v03_", ".csv", context.cacheDir)
+        val file = File.createTempFile("railimu_v05_", ".csv", context.cacheDir)
         val summaryBySegment = summaries.associateBy { it.segmentId }
         FileWriter(file, false).use { w ->
             w.appendLine(
@@ -23,8 +23,8 @@ object CsvLogger {
                     "lin_ax,lin_ay,lin_az,filt_ax,filt_ay,filt_az," +
                     "driftcorr_ax,driftcorr_ay,driftcorr_az," +
                     "vx,vy,vz,px,py,pz,speed_mps,distance_m," +
-                    "g_used,lpf_hz,stationary_window_s,stationary_accel_std_max,stationary_gyro_std_max," +
-                    "gyro_bias_bridge_strength,tilt_closure_strength,endpoint_velocity_corr_strength," +
+                    "g_used,lpf_hz,stationary_window_s,stationary_accel_std_fulltrust,stationary_gyro_std_fulltrust," +
+                    "gyro_bias_bridge_strength,tilt_closure_strength,endpoint_velocity_corr_strength,accel_bias_carryover_strength," +
                     "seg_duration_s,seg_raw_end_vx,seg_raw_end_vy,seg_raw_end_vz,seg_raw_end_speed," +
                     "seg_tilt_closure_deg,seg_start_bgx,seg_start_bgy,seg_start_bgz,seg_end_bgx,seg_end_bgy,seg_end_bgz," +
                     "seg_corrected_distance_m,seg_disp_x,seg_disp_y,seg_disp_z"
@@ -46,7 +46,7 @@ object CsvLogger {
                 add(s.positionLocal.x); add(s.positionLocal.y); add(s.positionLocal.z)
                 add(s.speedMps); add(s.distanceM)
                 add(gUsed); add(p.lowPassCutoffHz); add(p.stationaryWindowS); add(p.stationaryAccelStdMaxMps2); add(p.stationaryGyroStdMaxRadS)
-                add(p.gyroBiasBridgeStrength); add(p.tiltClosureStrength); add(p.endpointVelocityCorrectionStrength)
+                add(p.gyroBiasBridgeStrength); add(p.tiltClosureStrength); add(p.endpointVelocityCorrectionStrength); add(p.accelBiasCarryoverStrength)
                 if (m == null) repeat(17) { cols += "" } else {
                     add(m.durationS)
                     add(m.rawEndpointVelocity.x); add(m.rawEndpointVelocity.y); add(m.rawEndpointVelocity.z); add(m.rawEndpointSpeed)
