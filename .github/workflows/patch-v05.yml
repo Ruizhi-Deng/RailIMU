@@ -1,0 +1,139 @@
+name: Patch and Build RailIMU v0.5
+
+on:
+  push:
+    paths:
+      - '.github/workflows/patch-v05.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Patch v0.5
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def repl(text, old, new, label):
+              if old not in text:
+                  raise SystemExit(f'missing patch target: {label}')
+              return text.replace(old, new, 1)
+
+          # ---------- RailEstimator.kt ----------
+          p = Path('app/src/main/java/com/openai/railimu/RailEstimator.kt')
+          s = p.read_text()
+          s = repl(s,
+          '''        val gyroBiasBridgeStrength: Double = 1.0,\n        val tiltClosureStrength: Double = 1.0,\n        val endpointVelocityCorrectionStrength: Double = 1.0\n''',
+          '''        val gyroBiasBridgeStrength: Double = 1.0,\n        val tiltClosureStrength: Double = 1.0,\n        val endpointVelocityCorrectionStrength: Double = 1.0,\n        val accelBiasCarryoverStrength: Double = 0.7\n''', 'parameter field')
+          s = repl(s,
+          '''            require(tiltClosureStrength in 0.0..1.0)\n            require(endpointVelocityCorrectionStrength in 0.0..1.0)\n''',
+          '''            require(tiltClosureStrength in 0.0..1.0)\n            require(endpointVelocityCorrectionStrength in 0.0..1.0)\n            require(accelBiasCarryoverStrength in 0.0..1.0)\n''', 'parameter validation')
+          s = repl(s,
+          '''    private var segmentStartGyroBias=Vec3.ZERO\n    private var segmentStartPosition=Vec3.ZERO\n''',
+          '''    private var segmentStartGyroBias=Vec3.ZERO\n    private var learnedAccelBiasBody=Vec3.ZERO\n    private var segmentStartAccelBiasBody=Vec3.ZERO\n    private var segmentStartPosition=Vec3.ZERO\n''', 'bias state vars')
+          s = repl(s,
+          '''        measuring=true; startNs=null; segmentId=0; qSegmentStart=Quaternion.IDENTITY; currentGyroBias=c.gyroBiasBody; segmentStartGyroBias=currentGyroBias\n        segmentStartPosition=Vec3.ZERO; correctedTotalDistance=0.0; finalizedSegments=0; lastSummary=null; summaries.clear(); finalizedSamples.clear()\n''',
+          '''        measuring=true; startNs=null; segmentId=0; qSegmentStart=Quaternion.IDENTITY; currentGyroBias=c.gyroBiasBody; segmentStartGyroBias=currentGyroBias\n        learnedAccelBiasBody=Vec3.ZERO; segmentStartAccelBiasBody=Vec3.ZERO\n        segmentStartPosition=Vec3.ZERO; correctedTotalDistance=0.0; finalizedSegments=0; lastSummary=null; summaries.clear(); finalizedSamples.clear()\n''', 'start bias reset')
+          s = repl(s,
+          '''        val lin=qLive.rotate(raw)-gravityLocal; val prev=lastAccelNs; lastAccelNs=t\n''',
+          '''        val lin=qLive.rotate(raw-segmentStartAccelBiasBody)-gravityLocal; val prev=lastAccelNs; lastAccelNs=t\n''', 'live learned accel bias')
+          s = repl(s,
+          '''        val qRawAtAccel=arrayOfNulls<Quaternion>(acc.size)\n        var qRaw=qSegmentStart; var lastT=t0; var heldGyro=gyr.first().v; var gi=0; var ai=0\n        fun biasAt(t:Long):Vec3{val u=((t-t0).toDouble()/(t1-t0).toDouble()).coerceIn(0.0,1.0);return segmentStartGyroBias+(end.gyroBiasBody-segmentStartGyroBias)*(u*p.gyroBiasBridgeStrength)}\n''',
+          '''        fun softConfidence(std: Double, fullTrustStd: Double): Double {\n            if (std <= fullTrustStd) return 1.0\n            val excess = std / fullTrustStd - 1.0\n            return exp(-0.5 * excess * excess)\n        }\n        val accelStopQuality=softConfidence(end.accelStdMps2,p.stationaryAccelStdMaxMps2)\n        val gyroStopQuality=softConfidence(end.gyroStdRadS,p.stationaryGyroStdMaxRadS)\n        val trustedEndGyroBias=segmentStartGyroBias+(end.gyroBiasBody-segmentStartGyroBias)*gyroStopQuality\n\n        val qRawAtAccel=arrayOfNulls<Quaternion>(acc.size)\n        var qRaw=qSegmentStart; var lastT=t0; var heldGyro=gyr.first().v; var gi=0; var ai=0\n        fun biasAt(t:Long):Vec3{val u=((t-t0).toDouble()/(t1-t0).toDouble()).coerceIn(0.0,1.0);return segmentStartGyroBias+(trustedEndGyroBias-segmentStartGyroBias)*(u*p.gyroBiasBridgeStrength)}\n''', 'soft known-stop confidence')
+          s = repl(s,
+          '''        val closure=Quaternion.slerp(Quaternion.IDENTITY,fullClosure,p.tiltClosureStrength)\n''',
+          '''        val closure=Quaternion.slerp(Quaternion.IDENTITY,fullClosure,p.tiltClosureStrength*accelStopQuality)\n''', 'soft tilt closure')
+          s = repl(s,
+          '''            val l=qc.rotate(acc[i].a)-gravityLocal;lin[i]=l\n''',
+          '''            val l=qc.rotate(acc[i].a-segmentStartAccelBiasBody)-gravityLocal;lin[i]=l\n''', 'offline learned accel bias')
+          s = repl(s,
+          '''        val vEnd=vRaw.last(); val strength=p.endpointVelocityCorrectionStrength; val biasAccel=vEnd*(strength/T)\n''',
+          '''        val vEnd=vRaw.last(); val strength=p.endpointVelocityCorrectionStrength; val biasAccel=vEnd*(strength/T)\n        // Treat the remaining endpoint velocity error as an effective DC acceleration bias.\n        // Map it approximately back to the end body frame and carry a tunable fraction into the next segment.\n        val residualBiasBody=qCorr.last().conjugate().rotate(vEnd/T)\n        learnedAccelBiasBody=segmentStartAccelBiasBody+residualBiasBody*p.accelBiasCarryoverStrength\n        val learnedNorm=learnedAccelBiasBody.norm()\n        if(learnedNorm>0.20) learnedAccelBiasBody=learnedAccelBiasBody*(0.20/learnedNorm)\n''', 'learn endpoint accel bias')
+          s = repl(s,
+          '''        val summary=SegmentSummary(segmentId,T,vEnd,vEnd.norm(),closureDeg,segmentStartGyroBias,end.gyroBiasBody,segDist,corrPos,acc.size,gyr.size)\n        lastSummary=summary; summaries.add(summary); finalizedSegments++; segmentId++; currentGyroBias=end.gyroBiasBody; segmentStartGyroBias=currentGyroBias; qSegmentStart=(closure*qRawEnd).normalized()\n''',
+          '''        val summary=SegmentSummary(segmentId,T,vEnd,vEnd.norm(),closureDeg,segmentStartGyroBias,trustedEndGyroBias,segDist,corrPos,acc.size,gyr.size)\n        lastSummary=summary; summaries.add(summary); finalizedSegments++; segmentId++; currentGyroBias=trustedEndGyroBias; segmentStartGyroBias=currentGyroBias; segmentStartAccelBiasBody=learnedAccelBiasBody; qSegmentStart=(closure*qRawEnd).normalized()\n''', 'carry learned biases')
+          p.write_text(s)
+
+          # ---------- MainActivity.kt ----------
+          p = Path('app/src/main/java/com/openai/railimu/MainActivity.kt')
+          s = p.read_text()
+          s = repl(s, 'private lateinit var endpointVelEdit: EditText\n', 'private lateinit var endpointVelEdit: EditText\n    private lateinit var accelCarryEdit: EditText\n', 'UI field')
+          s = repl(s,
+          '''            tiltClosureStrength = tiltClosureEdit.text.toString().toDoubleOrNull() ?: return null,\n            endpointVelocityCorrectionStrength = endpointVelEdit.text.toString().toDoubleOrNull() ?: return null\n''',
+          '''            tiltClosureStrength = tiltClosureEdit.text.toString().toDoubleOrNull() ?: return null,\n            endpointVelocityCorrectionStrength = endpointVelEdit.text.toString().toDoubleOrNull() ?: return null,\n            accelBiasCarryoverStrength = accelCarryEdit.text.toString().toDoubleOrNull() ?: return null\n''', 'read carryover')
+          old_reject='''        val p = estimator.parameters()\n        if (c.accelStdMps2 > p.stationaryAccelStdMaxMps2 || c.gyroStdRadS > p.stationaryGyroStdMaxRadS) {\n            status.text = String.format(\n                Locale.US,\n                "Rejected: not stationary enough. accel std %.4f / %.4f, gyro std %.5f / %.5f. Segment remains open.",\n                c.accelStdMps2, p.stationaryAccelStdMaxMps2,\n                c.gyroStdRadS, p.stationaryGyroStdMaxRadS\n            )\n            return\n        }\n'''
+          new_reject='''        val p = estimator.parameters()\n        val noisyStop = c.accelStdMps2 > p.stationaryAccelStdMaxMps2 || c.gyroStdRadS > p.stationaryGyroStdMaxRadS\n'''
+          s = repl(s, old_reject, new_reject, 'known stop no hard reject')
+          s = repl(s,
+          '''            "Segment %d finalized · raw end speed %.3f m/s · tilt closure %.3f° · corrected distance %.1f m",\n            m.segmentId, m.rawEndpointSpeed, m.tiltClosureDeg, m.correctedDistanceM\n''',
+          '''            "Segment %d finalized · raw end speed %.3f m/s · tilt closure %.3f° · corrected distance %.1f m%s",\n            m.segmentId, m.rawEndpointSpeed, m.tiltClosureDeg, m.correctedDistanceM,\n            if (noisyStop) " · vibration high: stop correction soft-weighted" else ""\n''', 'noisy status note')
+          s = repl(s, 'root.addView(makeLabel("Rail IMU v0.4", 24f))', 'root.addView(makeLabel("Rail IMU v0.5", 24f))', 'title version')
+          s = repl(s,
+          '''        endpointVelEdit = numberField("1.0")\n\n        addParamRow(content, "g used (m/s²)", gEdit, "Filled by calibration; editable.")\n''',
+          '''        endpointVelEdit = numberField("1.0")\n        accelCarryEdit = numberField("0.7")\n\n        addParamRow(content, "g used (m/s²)", gEdit, "Filled by calibration; editable.")\n''', 'carryover field init')
+          s = repl(s,
+          '''        addParamRow(content, "Stop accel std max", accelStdEdit, "Reject stop update above this 3D accel std (m/s²).")\n        addParamRow(content, "Stop gyro std max", gyroStdEdit, "Reject stop update above this 3D gyro std (rad/s).")\n''',
+          '''        addParamRow(content, "Stop accel full-trust std", accelStdEdit, "KNOWN STOP is always accepted; above this vibration level, gravity closure is soft-weighted.")\n        addParamRow(content, "Stop gyro full-trust std", gyroStdEdit, "KNOWN STOP is always accepted; above this level, gyro-bias update is soft-weighted.")\n''', 'settings semantics')
+          s = repl(s,
+          '''        addParamRow(content, "Endpoint v correction", endpointVelEdit, "0 = off; 1 = full v(T)=0 drift closure.")\n''',
+          '''        addParamRow(content, "Endpoint v correction", endpointVelEdit, "0 = off; 1 = full v(T)=0 drift closure.")\n        addParamRow(content, "Accel bias carryover", accelCarryEdit, "0 = do not learn from previous stop; 1 = fully carry endpoint-estimated effective accel bias into next live segment. Default 0.7.")\n''', 'carryover settings row')
+          s = repl(s,
+          '''        endpointVelEdit.isEnabled = enabled\n''',
+          '''        endpointVelEdit.isEnabled = enabled\n        accelCarryEdit.isEnabled = enabled\n''', 'enable carryover setting')
+          s = s.replace('railimu_v04_', 'railimu_v05_')
+          p.write_text(s)
+
+          # ---------- app version ----------
+          p = Path('app/build.gradle.kts')
+          s = p.read_text().replace('versionCode = 4', 'versionCode = 5').replace('versionName = "0.4.0"', 'versionName = "0.5.0"')
+          p.write_text(s)
+          PY
+
+      - name: Commit patched source
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/openai/railimu/RailEstimator.kt app/src/main/java/com/openai/railimu/MainActivity.kt app/build.gradle.kts
+          git commit -m "Implement v0.5 known-stop soft weighting and learned live bias"
+          git push origin master
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platform
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Build v0.5 debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Upload v0.5 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RailIMU-v0.5-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
