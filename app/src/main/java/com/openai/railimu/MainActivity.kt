@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -26,7 +27,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
     private var gyroscope: Sensor? = null
-    private val estimator = RailEstimator(5.0)
+    private val estimator = RailEstimator()
     private val handler = Handler(Looper.getMainLooper())
 
     private var calibrationAccumulator: CalibrationAccumulator? = null
@@ -39,10 +40,15 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var status: TextView
     private lateinit var calibrationInfo: TextView
     private lateinit var gEdit: EditText
+    private lateinit var cutoffEdit: EditText
+    private lateinit var gravityTauEdit: EditText
+    private lateinit var gravityGateEdit: EditText
+    private lateinit var maxCorrEdit: EditText
     private lateinit var live: TextView
     private lateinit var calibrate: Button
     private lateinit var start: Button
     private lateinit var stop: Button
+    private lateinit var zeroV: Button
     private lateinit var export: Button
 
     private val finishCalibrationRunnable = Runnable { finishCalibration() }
@@ -81,7 +87,7 @@ class MainActivity : Activity(), SensorEventListener {
                 calibrationAccumulator?.addAccel(v)
                 if (estimator.isMeasuring()) {
                     val s = estimator.onAccelerometer(event.timestamp, v)
-                    csvLogger?.append(s, estimator.gUsed())
+                    csvLogger?.append(s, estimator.gUsed(), estimator.parameters())
                     if (event.timestamp - lastUiNs >= 100_000_000L) {
                         lastUiNs = event.timestamp
                         refreshUi(s)
@@ -119,35 +125,48 @@ class MainActivity : Activity(), SensorEventListener {
         }
         estimator.setCalibration(c)
         gEdit.setText(String.format(Locale.US, "%.6f", c.measuredG))
-        gEdit.isEnabled = true
+        setSettingsEnabled(true)
         start.isEnabled = true
         calibrationInfo.text = String.format(
             Locale.US,
-            "measured g = %.6f m/s²\ngravity direction in phone frame = [%.5f, %.5f, %.5f]\ngyro bias = [%.6f, %.6f, %.6f] rad/s",
+            "measured g = %.6f m/s²\ngravity/support direction in phone frame = [%.5f, %.5f, %.5f]\ngyro bias = [%.6f, %.6f, %.6f] rad/s",
             c.measuredG,
             c.measuredGravityVectorBody.normalized().x,
             c.measuredGravityVectorBody.normalized().y,
             c.measuredGravityVectorBody.normalized().z,
             c.gyroBiasBody.x, c.gyroBiasBody.y, c.gyroBiasBody.z
         )
-        status.text = "Calibrated. You may edit g, then press Start. Do not move the phone after calibration."
+        status.text = "Calibrated. Edit parameters if desired, then Start."
+    }
+
+    private fun readParameters(): RailEstimator.Parameters? {
+        val p = RailEstimator.Parameters(
+            lowPassCutoffHz = cutoffEdit.text.toString().toDoubleOrNull() ?: return null,
+            gravityCorrectionTauS = gravityTauEdit.text.toString().toDoubleOrNull() ?: return null,
+            gravityMagnitudeGateMps2 = gravityGateEdit.text.toString().toDoubleOrNull() ?: return null,
+            maxGravityCorrectionDegPerSec = maxCorrEdit.text.toString().toDoubleOrNull() ?: return null
+        )
+        return runCatching { p.validate(); p }.getOrNull()
     }
 
     private fun startMeasurement() {
         val g = gEdit.text.toString().toDoubleOrNull()
+        val p = readParameters()
         if (estimator.calibration() == null) { toast("Calibrate first"); return }
         if (g == null || g !in 5.0..15.0) { toast("Invalid g value"); return }
+        if (p == null) { toast("One or more tuning parameters are invalid"); return }
         completedCsv = null
         csvLogger = CsvLogger(this)
-        estimator.start(g)
+        estimator.start(g, p)
         lastUiNs = 0L
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         calibrate.isEnabled = false
         start.isEnabled = false
         stop.isEnabled = true
+        zeroV.isEnabled = true
         export.isEnabled = false
-        gEdit.isEnabled = false
-        status.text = "Recording. Reference frame = phone frame at Start; no forward-direction calibration."
+        setSettingsEnabled(false)
+        status.text = "Recording. Local frame = phone frame at Start. Manual Zero V is safe only when you know the train is stopped."
         refreshUi(estimator.state())
     }
 
@@ -160,9 +179,17 @@ class MainActivity : Activity(), SensorEventListener {
         calibrate.isEnabled = true
         start.isEnabled = true
         stop.isEnabled = false
+        zeroV.isEnabled = false
         export.isEnabled = completedCsv != null
-        gEdit.isEnabled = true
-        status.text = "$reason. Export CSV if you want to analyze the run."
+        setSettingsEnabled(true)
+        status.text = "$reason. Export CSV to compare tuning parameters."
+    }
+
+    private fun zeroVelocityNow() {
+        if (!estimator.isMeasuring()) return
+        estimator.zeroVelocity()
+        toast("Velocity reset to zero")
+        refreshUi(estimator.state())
     }
 
     private fun exportCsv() {
@@ -186,36 +213,55 @@ class MainActivity : Activity(), SensorEventListener {
             contentResolver.openOutputStream(uri)?.use { out -> src.inputStream().use { it.copyTo(out) } }
                 ?: error("Could not open destination")
         }.onSuccess { toast("CSV exported") }
-         .onFailure { toast("Export failed: ${it.message}") }
+            .onFailure { toast("Export failed: ${it.message}") }
     }
 
     private fun refreshUi(s: RailEstimator.State) {
         live.text = String.format(
             Locale.US,
             "raw accel  [%+.4f, %+.4f, %+.4f] m/s²\n" +
-                "raw gyro  [%+.5f, %+.5f, %+.5f] rad/s\n\n" +
-                "a_local    [%+.4f, %+.4f, %+.4f] m/s²\n" +
-                "v_local    [%+.4f, %+.4f, %+.4f] m/s\n" +
-                "p_local    [%+.2f, %+.2f, %+.2f] m\n\n" +
+                "raw gyro   [%+.5f, %+.5f, %+.5f] rad/s\n\n" +
+                "a filtered [%+.4f, %+.4f, %+.4f] m/s²\n" +
+                "v local    [%+.4f, %+.4f, %+.4f] m/s\n" +
+                "p local    [%+.2f, %+.2f, %+.2f] m\n\n" +
                 "speed      %.3f m/s   (%.2f km/h)\n" +
                 "|position| %.2f m\n" +
-                "time       %.1f s",
+                "time       %.1f s\n\n" +
+                "tilt corr  %s   |a|-g err %.4f\n" +
+                "corr omega [%+.5f, %+.5f, %+.5f] rad/s\n" +
+                "manual ZUPT count %d",
             latestAccel.x, latestAccel.y, latestAccel.z,
             latestGyro.x, latestGyro.y, latestGyro.z,
             s.filteredAccelLocal.x, s.filteredAccelLocal.y, s.filteredAccelLocal.z,
             s.velocityLocal.x, s.velocityLocal.y, s.velocityLocal.z,
             s.positionLocal.x, s.positionLocal.y, s.positionLocal.z,
-            s.speed, s.speed * 3.6, s.displacement, s.elapsedSeconds
+            s.speed, s.speed * 3.6, s.displacement, s.elapsedSeconds,
+            if (s.gravityCorrectionActive) "ON" else "OFF", s.accelMagnitudeError,
+            s.gravityCorrectionOmegaBody.x, s.gravityCorrectionOmegaBody.y, s.gravityCorrectionOmegaBody.z,
+            s.manualZuptCount
         )
     }
 
     private fun buildUi() {
         val d = resources.displayMetrics.density
-        fun dp(v: Int) = (v*d).toInt()
+        fun dp(v: Int) = (v * d).toInt()
         fun text(t: String, sp: Float = 14f) = TextView(this).apply { text = t; textSize = sp; setPadding(0, dp(5), 0, dp(5)) }
+        fun numberField(default: String) = EditText(this).apply {
+            setText(default)
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
+            isSingleLine = true
+        }
+        fun paramRow(root: LinearLayout, label: String, field: EditText, hint: String) {
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+            row.addView(text(label, 13f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.35f))
+            row.addView(field, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.65f))
+            root.addView(row)
+            root.addView(text(hint, 11f))
+        }
+
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(18), dp(18), dp(28)) }
-        root.addView(text("Rail IMU", 28f))
-        root.addView(text("Raw accelerometer + gyroscope; ~5 min rail experiment", 14f))
+        root.addView(text("Rail IMU v0.2", 28f))
+        root.addView(text("Raw accelerometer + gyroscope; tunable rail inertial experiment", 14f))
         status = text("Initializing…", 15f); root.addView(status)
 
         calibrate = Button(this).apply { text = "Calibrate 5 s"; setOnClickListener { beginCalibration() } }
@@ -227,17 +273,37 @@ class MainActivity : Activity(), SensorEventListener {
         row.addView(stop, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(row)
 
-        val gRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        gRow.addView(text("g used (m/s²): ", 14f))
-        gEdit = EditText(this).apply { setText("9.80665"); isEnabled = false }
-        gRow.addView(gEdit, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        root.addView(gRow)
+        root.addView(text("Tuning parameters", 18f))
+        gEdit = numberField("9.80665").apply { isEnabled = false }
+        cutoffEdit = numberField("1.0")
+        gravityTauEdit = numberField("60.0")
+        gravityGateEdit = numberField("0.20")
+        maxCorrEdit = numberField("0.15")
+        paramRow(root, "g used (m/s²)", gEdit, "Filled from calibration; you can override it.")
+        paramRow(root, "LPF cutoff (Hz)", cutoffEdit, "2nd-order Butterworth. Lower = smoother but more lag. Valid 0.05–20.")
+        paramRow(root, "Tilt correction tau (s)", gravityTauEdit, "Accelerometer slowly corrects gyro roll/pitch drift. Larger = weaker/slower; 0 disables. Default 60.")
+        paramRow(root, "|a|-g gate (m/s²)", gravityGateEdit, "Tilt correction runs only when accelerometer magnitude is this close to g. Default 0.20.")
+        paramRow(root, "Max tilt corr (deg/s)", maxCorrEdit, "Hard limit on accelerometer attitude correction rate. Default 0.15.")
 
         calibrationInfo = text("Not calibrated", 13f); root.addView(calibrationInfo)
         live = text("No measurement", 16f).apply { typeface = android.graphics.Typeface.MONOSPACE }; root.addView(live)
+        zeroV = Button(this).apply {
+            text = "ZERO VELOCITY NOW (train stopped)"
+            isEnabled = false
+            setOnClickListener { zeroVelocityNow() }
+        }
+        root.addView(zeroV)
         export = Button(this).apply { text = "Export last CSV"; isEnabled = false; setOnClickListener { exportCsv() } }; root.addView(export)
-        root.addView(text("Pipeline: TYPE_ACCELEROMETER + TYPE_GYROSCOPE → stationary g/gyro-bias calibration → gyro attitude integration → rotate acceleration into Start-local frame → subtract calibrated gravity → 5 Hz low-pass → trapezoidal integration. No forward calibration, no GPS, no magnetometer, no Android LINEAR_ACCELERATION.", 12f))
+        root.addView(text("Important: automatic ZUPT is intentionally NOT used. An IMU cannot distinguish a stopped train from perfectly constant-speed cruising, so auto-zeroing from low acceleration/gyro alone would be physically wrong. Use Zero Velocity only at a known stop.\n\nPipeline: raw TYPE_ACCELEROMETER + TYPE_GYROSCOPE → calibrated g/gyro bias → gyro attitude + gated slow accelerometer tilt correction → Start-local gravity subtraction → tunable 2nd-order Butterworth LPF → trapezoidal integration.", 12f))
         setContentView(ScrollView(this).apply { addView(root) })
+    }
+
+    private fun setSettingsEnabled(enabled: Boolean) {
+        gEdit.isEnabled = enabled && estimator.calibration() != null
+        cutoffEdit.isEnabled = enabled
+        gravityTauEdit.isEnabled = enabled
+        gravityGateEdit.isEnabled = enabled
+        maxCorrEdit.isEnabled = enabled
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
