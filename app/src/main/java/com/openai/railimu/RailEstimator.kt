@@ -10,7 +10,8 @@ class RailEstimator {
         val stationaryGyroStdMaxRadS: Double = 0.006,
         val gyroBiasBridgeStrength: Double = 1.0,
         val tiltClosureStrength: Double = 1.0,
-        val endpointVelocityCorrectionStrength: Double = 1.0
+        val endpointVelocityCorrectionStrength: Double = 1.0,
+        val accelBiasCarryoverStrength: Double = 0.7
     ) {
         fun validate() {
             require(lowPassCutoffHz in 0.05..20.0)
@@ -20,6 +21,7 @@ class RailEstimator {
             require(gyroBiasBridgeStrength in 0.0..1.5)
             require(tiltClosureStrength in 0.0..1.0)
             require(endpointVelocityCorrectionStrength in 0.0..1.0)
+            require(accelBiasCarryoverStrength in 0.0..1.0)
         }
     }
 
@@ -106,6 +108,8 @@ class RailEstimator {
     private var qSegmentStart=Quaternion.IDENTITY
     private var currentGyroBias=Vec3.ZERO
     private var segmentStartGyroBias=Vec3.ZERO
+    private var learnedAccelBiasBody=Vec3.ZERO
+    private var segmentStartAccelBiasBody=Vec3.ZERO
     private var segmentStartPosition=Vec3.ZERO
     private var correctedTotalDistance=0.0
     private var finalizedSegments=0
@@ -139,6 +143,7 @@ class RailEstimator {
         val c=requireNotNull(calibration); params.validate(); require(gOverride in 5.0..15.0)
         p=params; gUsed=gOverride; gravityLocal=c.measuredGravityVectorBody.normalized()*gUsed; gravityUnitLocal=gravityLocal.normalized()
         measuring=true; startNs=null; segmentId=0; qSegmentStart=Quaternion.IDENTITY; currentGyroBias=c.gyroBiasBody; segmentStartGyroBias=currentGyroBias
+        learnedAccelBiasBody=Vec3.ZERO; segmentStartAccelBiasBody=Vec3.ZERO
         segmentStartPosition=Vec3.ZERO; correctedTotalDistance=0.0; finalizedSegments=0; lastSummary=null; summaries.clear(); finalizedSamples.clear()
         resetSegmentBuffersAndLive()
         state=State(measuring=true)
@@ -160,7 +165,7 @@ class RailEstimator {
     fun onAccelerometer(t:Long, raw:Vec3):State{
         if(!measuring)return state
         if(startNs==null)startNs=t; accelEvents.add(AccelEvent(t,raw,latestGyro))
-        val lin=qLive.rotate(raw)-gravityLocal; val prev=lastAccelNs; lastAccelNs=t
+        val lin=qLive.rotate(raw-segmentStartAccelBiasBody)-gravityLocal; val prev=lastAccelNs; lastAccelNs=t
         if(prev==null){liveLpf.reset(lin);liveA=lin;prevLiveA=lin}
         else { val dt=(t-prev)*1e-9; if(dt in 0.0001..0.1){liveA=liveLpf.update(lin,p.lowPassCutoffHz,dt); val oldV=liveV; val ap=prevLiveA?:liveA; liveV=liveV+(ap+liveA)*(0.5*dt); liveP=liveP+(oldV+liveV)*(0.5*dt); val sp=liveV.norm(); liveDistance+=0.5*(prevLiveSpeed+sp)*dt; prevLiveSpeed=sp; prevLiveA=liveA} }
         val elapsed=startNs?.let{(t-it)*1e-9}?:0.0
@@ -175,9 +180,18 @@ class RailEstimator {
         val acc=accelEvents.toList(); val gyr=gyroEvents.toList(); val t0=minOf(acc.first().t,gyr.first().t); val t1=maxOf(acc.last().t,gyr.last().t); val T=(t1-t0)*1e-9
         require(T>0.1)
         // Reintegrate gyro with bias slowly bridged from the start-stop estimate to the end-stop estimate.
+        fun softConfidence(std: Double, fullTrustStd: Double): Double {
+            if (std <= fullTrustStd) return 1.0
+            val excess = std / fullTrustStd - 1.0
+            return exp(-0.5 * excess * excess)
+        }
+        val accelStopQuality=softConfidence(end.accelStdMps2,p.stationaryAccelStdMaxMps2)
+        val gyroStopQuality=softConfidence(end.gyroStdRadS,p.stationaryGyroStdMaxRadS)
+        val trustedEndGyroBias=segmentStartGyroBias+(end.gyroBiasBody-segmentStartGyroBias)*gyroStopQuality
+
         val qRawAtAccel=arrayOfNulls<Quaternion>(acc.size)
         var qRaw=qSegmentStart; var lastT=t0; var heldGyro=gyr.first().v; var gi=0; var ai=0
-        fun biasAt(t:Long):Vec3{val u=((t-t0).toDouble()/(t1-t0).toDouble()).coerceIn(0.0,1.0);return segmentStartGyroBias+(end.gyroBiasBody-segmentStartGyroBias)*(u*p.gyroBiasBridgeStrength)}
+        fun biasAt(t:Long):Vec3{val u=((t-t0).toDouble()/(t1-t0).toDouble()).coerceIn(0.0,1.0);return segmentStartGyroBias+(trustedEndGyroBias-segmentStartGyroBias)*(u*p.gyroBiasBridgeStrength)}
         while(gi<gyr.size || ai<acc.size){
             val tg=if(gi<gyr.size)gyr[gi].t else Long.MAX_VALUE; val ta=if(ai<acc.size)acc[ai].t else Long.MAX_VALUE; val tn=minOf(tg,ta)
             if(tn>lastT){val dt=(tn-lastT)*1e-9; val tm=lastT+(tn-lastT)/2L; qRaw=(qRaw*Quaternion.fromBodyAngularVelocity(heldGyro-biasAt(tm),dt)).normalized();lastT=tn}
@@ -186,18 +200,24 @@ class RailEstimator {
         val qRawEnd=(qRawAtAccel.lastOrNull()?:qRaw)!!
         val endGravityInLocalPred=qRawEnd.rotate(end.measuredGravityVectorBody.normalized())
         val fullClosure=Quaternion.fromTwoVectors(endGravityInLocalPred,gravityUnitLocal)
-        val closure=Quaternion.slerp(Quaternion.IDENTITY,fullClosure,p.tiltClosureStrength)
+        val closure=Quaternion.slerp(Quaternion.IDENTITY,fullClosure,p.tiltClosureStrength*accelStopQuality)
         val closureDeg=closure.angleRad()*180.0/Math.PI
 
         val lpf=Butterworth2LowPass(); val vRaw=Array(acc.size){Vec3.ZERO}; val pRaw=Array(acc.size){Vec3.ZERO}; val filt=Array(acc.size){Vec3.ZERO}; val lin=Array(acc.size){Vec3.ZERO}; val qCorr=Array(acc.size){Quaternion.IDENTITY}
         var v=Vec3.ZERO; var pos=Vec3.ZERO; var prevA=Vec3.ZERO; var prevT:Long?=null
         for(i in acc.indices){
             val u=((acc[i].t-t0).toDouble()/(t1-t0).toDouble()).coerceIn(0.0,1.0); val cu=Quaternion.slerp(Quaternion.IDENTITY,closure,u); val qc=(cu*qRawAtAccel[i]!!).normalized();qCorr[i]=qc
-            val l=qc.rotate(acc[i].a)-gravityLocal;lin[i]=l
+            val l=qc.rotate(acc[i].a-segmentStartAccelBiasBody)-gravityLocal;lin[i]=l
             if(i==0){lpf.reset(l);filt[i]=l;prevA=l}else{val dt=(acc[i].t-(prevT?:acc[i-1].t))*1e-9; val aF=if(dt in 0.0001..0.1)lpf.update(l,p.lowPassCutoffHz,dt) else l;filt[i]=aF;if(dt in 0.0001..0.1){val oldV=v;v=v+(prevA+aF)*(0.5*dt);pos=pos+(oldV+v)*(0.5*dt)};prevA=aF}
             vRaw[i]=v;pRaw[i]=pos;prevT=acc[i].t
         }
         val vEnd=vRaw.last(); val strength=p.endpointVelocityCorrectionStrength; val biasAccel=vEnd*(strength/T)
+        // Treat the remaining endpoint velocity error as an effective DC acceleration bias.
+        // Map it approximately back to the end body frame and carry a tunable fraction into the next segment.
+        val residualBiasBody=qCorr.last().conjugate().rotate(vEnd/T)
+        learnedAccelBiasBody=segmentStartAccelBiasBody+residualBiasBody*p.accelBiasCarryoverStrength
+        val learnedNorm=learnedAccelBiasBody.norm()
+        if(learnedNorm>0.20) learnedAccelBiasBody=learnedAccelBiasBody*(0.20/learnedNorm)
         var corrPos=Vec3.ZERO; var segDist=0.0; var prevVC=Vec3.ZERO; var prevSpeed=0.0; var prevTime=acc.first().t
         val corrected=ArrayList<Sample>(acc.size)
         for(i in acc.indices){
@@ -209,8 +229,8 @@ class RailEstimator {
             corrected.add(Sample(segmentId,true,acc[i].t,elapsed,acc[i].a,acc[i].gyroSnapshot,qCorr[i],lin[i],filt[i],filt[i]-biasAccel,vc,segmentStartPosition+corrPos,vc.norm(),correctedTotalDistance+segDist))
         }
         finalizedSamples.addAll(corrected); liveSamples.clear(); correctedTotalDistance+=segDist; segmentStartPosition+=corrPos
-        val summary=SegmentSummary(segmentId,T,vEnd,vEnd.norm(),closureDeg,segmentStartGyroBias,end.gyroBiasBody,segDist,corrPos,acc.size,gyr.size)
-        lastSummary=summary; summaries.add(summary); finalizedSegments++; segmentId++; currentGyroBias=end.gyroBiasBody; segmentStartGyroBias=currentGyroBias; qSegmentStart=(closure*qRawEnd).normalized()
+        val summary=SegmentSummary(segmentId,T,vEnd,vEnd.norm(),closureDeg,segmentStartGyroBias,trustedEndGyroBias,segDist,corrPos,acc.size,gyr.size)
+        lastSummary=summary; summaries.add(summary); finalizedSegments++; segmentId++; currentGyroBias=trustedEndGyroBias; segmentStartGyroBias=currentGyroBias; segmentStartAccelBiasBody=learnedAccelBiasBody; qSegmentStart=(closure*qRawEnd).normalized()
         resetSegmentBuffersAndLive()
         val nowElapsed=startNs?.let{(t1-it)*1e-9}?:0.0
         state=State(true,segmentId,nowElapsed,end.measuredGravityVectorBody,Vec3.ZERO,Vec3.ZERO,Vec3.ZERO,segmentStartPosition,0.0,correctedTotalDistance,finalizedSegments,true,summary)

@@ -64,6 +64,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var biasBridgeEdit: EditText
     private lateinit var tiltClosureEdit: EditText
     private lateinit var endpointVelEdit: EditText
+    private lateinit var accelCarryEdit: EditText
 
     private lateinit var calibrateBtn: Button
     private lateinit var startBtn: Button
@@ -137,7 +138,8 @@ class MainActivity : Activity(), SensorEventListener {
             stationaryGyroStdMaxRadS = gyroStdEdit.text.toString().toDoubleOrNull() ?: return null,
             gyroBiasBridgeStrength = biasBridgeEdit.text.toString().toDoubleOrNull() ?: return null,
             tiltClosureStrength = tiltClosureEdit.text.toString().toDoubleOrNull() ?: return null,
-            endpointVelocityCorrectionStrength = endpointVelEdit.text.toString().toDoubleOrNull() ?: return null
+            endpointVelocityCorrectionStrength = endpointVelEdit.text.toString().toDoubleOrNull() ?: return null,
+            accelBiasCarryoverStrength = accelCarryEdit.text.toString().toDoubleOrNull() ?: return null
         )
         return runCatching { p.validate(); p }.getOrNull()
     }
@@ -223,23 +225,16 @@ class MainActivity : Activity(), SensorEventListener {
             return
         }
         val p = estimator.parameters()
-        if (c.accelStdMps2 > p.stationaryAccelStdMaxMps2 || c.gyroStdRadS > p.stationaryGyroStdMaxRadS) {
-            status.text = String.format(
-                Locale.US,
-                "Rejected: not stationary enough. accel std %.4f / %.4f, gyro std %.5f / %.5f. Segment remains open.",
-                c.accelStdMps2, p.stationaryAccelStdMaxMps2,
-                c.gyroStdRadS, p.stationaryGyroStdMaxRadS
-            )
-            return
-        }
+        val noisyStop = c.accelStdMps2 > p.stationaryAccelStdMaxMps2 || c.gyroStdRadS > p.stationaryGyroStdMaxRadS
         val m = runCatching { estimator.finalizeStationary(c) }.getOrElse {
             status.text = "Segment closure failed: ${it.message}"
             return
         }
         status.text = String.format(
             Locale.US,
-            "Segment %d finalized · raw end speed %.3f m/s · tilt closure %.3f° · corrected distance %.1f m",
-            m.segmentId, m.rawEndpointSpeed, m.tiltClosureDeg, m.correctedDistanceM
+            "Segment %d finalized · raw end speed %.3f m/s · tilt closure %.3f° · corrected distance %.1f m%s",
+            m.segmentId, m.rawEndpointSpeed, m.tiltClosureDeg, m.correctedDistanceM,
+            if (noisyStop) " · vibration high: stop correction soft-weighted" else ""
         )
         refreshUi(estimator.state())
         updateRouteView()
@@ -278,7 +273,7 @@ class MainActivity : Activity(), SensorEventListener {
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "text/csv"
-            putExtra(Intent.EXTRA_TITLE, "railimu_v04_${System.currentTimeMillis()}.csv")
+            putExtra(Intent.EXTRA_TITLE, "railimu_v05_${System.currentTimeMillis()}.csv")
         }
         @Suppress("DEPRECATION")
         startActivityForResult(intent, 1001)
@@ -354,7 +349,7 @@ class MainActivity : Activity(), SensorEventListener {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(10))
         }
-        root.addView(makeLabel("Rail IMU v0.4", 24f))
+        root.addView(makeLabel("Rail IMU v0.5", 24f))
 
         val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         runTab = Button(this).apply { text = "RUN"; setOnClickListener { showPage(PAGE_RUN) } }
@@ -466,15 +461,17 @@ class MainActivity : Activity(), SensorEventListener {
         biasBridgeEdit = numberField("1.0")
         tiltClosureEdit = numberField("1.0")
         endpointVelEdit = numberField("1.0")
+        accelCarryEdit = numberField("0.7")
 
         addParamRow(content, "g used (m/s²)", gEdit, "Filled by calibration; editable.")
         addParamRow(content, "LPF cutoff (Hz)", cutoffEdit, "2nd-order Butterworth, 0.05–20 Hz.")
         addParamRow(content, "Stop window (s)", stopWindowEdit, "Static capture duration after Stationary Update.")
-        addParamRow(content, "Stop accel std max", accelStdEdit, "Reject stop update above this 3D accel std (m/s²).")
-        addParamRow(content, "Stop gyro std max", gyroStdEdit, "Reject stop update above this 3D gyro std (rad/s).")
+        addParamRow(content, "Stop accel full-trust std", accelStdEdit, "KNOWN STOP is always accepted; above this vibration level, gravity closure is soft-weighted.")
+        addParamRow(content, "Stop gyro full-trust std", gyroStdEdit, "KNOWN STOP is always accepted; above this level, gyro-bias update is soft-weighted.")
         addParamRow(content, "Gyro bias bridge", biasBridgeEdit, "0 = off; 1 = linear start-stop → end-stop bias bridge.")
         addParamRow(content, "Tilt closure strength", tiltClosureEdit, "0 = off; 1 = full endpoint gravity roll/pitch closure.")
         addParamRow(content, "Endpoint v correction", endpointVelEdit, "0 = off; 1 = full v(T)=0 drift closure.")
+        addParamRow(content, "Accel bias carryover", accelCarryEdit, "0 = do not learn from previous stop; 1 = fully carry endpoint-estimated effective accel bias into next live segment. Default 0.7.")
 
         content.addView(makeLabel("Calibration", 19f))
         calibrationInfo = makeLabel("Not calibrated", 13f)
@@ -520,6 +517,7 @@ class MainActivity : Activity(), SensorEventListener {
         biasBridgeEdit.isEnabled = enabled
         tiltClosureEdit.isEnabled = enabled
         endpointVelEdit.isEnabled = enabled
+        accelCarryEdit.isEnabled = enabled
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
