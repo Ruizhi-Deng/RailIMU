@@ -12,10 +12,12 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -37,10 +39,23 @@ class MainActivity : Activity(), SensorEventListener {
     private var latestA = Vec3.ZERO
     private var latestW = Vec3.ZERO
     private var lastUiNs = 0L
+    private var lastRouteUiNs = 0L
+    private var currentPage = PAGE_RUN
+
+    private lateinit var runPage: View
+    private lateinit var routePage: View
+    private lateinit var settingsPage: View
+    private lateinit var runTab: Button
+    private lateinit var routeTab: Button
+    private lateinit var settingsTab: Button
 
     private lateinit var status: TextView
     private lateinit var calibrationInfo: TextView
+    private lateinit var speedHero: TextView
     private lateinit var live: TextView
+    private lateinit var routeInfo: TextView
+    private lateinit var trajectoryView: TrajectoryView
+
     private lateinit var gEdit: EditText
     private lateinit var cutoffEdit: EditText
     private lateinit var stopWindowEdit: EditText
@@ -49,6 +64,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var biasBridgeEdit: EditText
     private lateinit var tiltClosureEdit: EditText
     private lateinit var endpointVelEdit: EditText
+
     private lateinit var calibrateBtn: Button
     private lateinit var startBtn: Button
     private lateinit var stopBtn: Button
@@ -61,11 +77,12 @@ class MainActivity : Activity(), SensorEventListener {
         accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         gyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         buildUi()
+        showPage(PAGE_RUN)
         if (accel == null || gyro == null) {
             status.text = "Raw accelerometer or gyroscope unavailable."
             calibrateBtn.isEnabled = false
         } else {
-            status.text = "Fix phone rigidly to train. Initial calibration must be fully stationary."
+            status.text = "Fix phone rigidly to train. Calibrate while the train is fully stationary."
         }
     }
 
@@ -95,6 +112,10 @@ class MainActivity : Activity(), SensorEventListener {
                         lastUiNs = e.timestamp
                         refreshUi(s)
                     }
+                    if (currentPage == PAGE_ROUTE && e.timestamp - lastRouteUiNs >= 1_000_000_000L) {
+                        lastRouteUiNs = e.timestamp
+                        updateRouteView()
+                    }
                 }
             }
             Sensor.TYPE_GYROSCOPE -> {
@@ -118,10 +139,7 @@ class MainActivity : Activity(), SensorEventListener {
             tiltClosureStrength = tiltClosureEdit.text.toString().toDoubleOrNull() ?: return null,
             endpointVelocityCorrectionStrength = endpointVelEdit.text.toString().toDoubleOrNull() ?: return null
         )
-        return runCatching {
-            p.validate()
-            p
-        }.getOrNull()
+        return runCatching { p.validate(); p }.getOrNull()
     }
 
     private fun beginInitialCalibration() {
@@ -147,15 +165,12 @@ class MainActivity : Activity(), SensorEventListener {
         setSettingsEnabled(true)
         calibrationInfo.text = String.format(
             Locale.US,
-            "g=%.6f m/s²   accel 3D std=%.5f m/s²\ngyro bias=[%+.6f,%+.6f,%+.6f] rad/s   gyro 3D std=%.6f rad/s",
-            c.measuredG,
-            c.accelStdMps2,
-            c.gyroBiasBody.x,
-            c.gyroBiasBody.y,
-            c.gyroBiasBody.z,
+            "g = %.6f m/s²\naccel 3D std = %.5f m/s²\ngyro bias = [%+.6f, %+.6f, %+.6f] rad/s\ngyro 3D std = %.6f rad/s",
+            c.measuredG, c.accelStdMps2,
+            c.gyroBiasBody.x, c.gyroBiasBody.y, c.gyroBiasBody.z,
             c.gyroStdRadS
         )
-        status.text = "Calibrated. Edit parameters if desired, then Start."
+        status.text = "Calibrated. Adjust Settings if desired, then Start."
     }
 
     private fun startMeasurement() {
@@ -166,12 +181,13 @@ class MainActivity : Activity(), SensorEventListener {
             return
         }
         if (g == null || g !in 5.0..15.0 || p == null) {
-            toast("Invalid parameter")
+            toast("Invalid parameter in Settings")
             return
         }
         estimator.start(g, p)
         completedCsv = null
         lastUiNs = 0L
+        lastRouteUiNs = 0L
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         calibrateBtn.isEnabled = false
         startBtn.isEnabled = false
@@ -179,8 +195,9 @@ class MainActivity : Activity(), SensorEventListener {
         stationaryBtn.isEnabled = true
         exportBtn.isEnabled = false
         setSettingsEnabled(false)
-        status.text = "RUNNING: live values are provisional. At a known full stop, press STATIONARY UPDATE to close and reprocess the segment."
+        status.text = "RUNNING. Live velocity/route are provisional. At a known full stop, press STATIONARY UPDATE."
         refreshUi(estimator.state())
+        updateRouteView()
     }
 
     private fun beginStationaryUpdate() {
@@ -190,11 +207,7 @@ class MainActivity : Activity(), SensorEventListener {
         stopAcc = CalibrationAccumulator()
         stationaryBtn.isEnabled = false
         stopBtn.isEnabled = false
-        status.text = String.format(
-            Locale.US,
-            "Stationary update: hold fully stopped for %.1f s…",
-            p.stationaryWindowS
-        )
+        status.text = String.format(Locale.US, "Stationary update: remain fully stopped for %.1f s…", p.stationaryWindowS)
         handler.postDelayed({ finishStationaryUpdate() }, (p.stationaryWindowS * 1000.0).toLong())
     }
 
@@ -205,7 +218,6 @@ class MainActivity : Activity(), SensorEventListener {
         stopCapture = false
         stationaryBtn.isEnabled = true
         stopBtn.isEnabled = true
-
         val c = runCatching { requireNotNull(acc).result() }.getOrElse {
             status.text = "Stationary capture failed: ${it.message}"
             return
@@ -214,28 +226,23 @@ class MainActivity : Activity(), SensorEventListener {
         if (c.accelStdMps2 > p.stationaryAccelStdMaxMps2 || c.gyroStdRadS > p.stationaryGyroStdMaxRadS) {
             status.text = String.format(
                 Locale.US,
-                "Rejected: not stationary enough. accel std %.4f (max %.4f), gyro std %.5f (max %.5f). Segment NOT closed.",
-                c.accelStdMps2,
-                p.stationaryAccelStdMaxMps2,
-                c.gyroStdRadS,
-                p.stationaryGyroStdMaxRadS
+                "Rejected: not stationary enough. accel std %.4f / %.4f, gyro std %.5f / %.5f. Segment remains open.",
+                c.accelStdMps2, p.stationaryAccelStdMaxMps2,
+                c.gyroStdRadS, p.stationaryGyroStdMaxRadS
             )
             return
         }
-
         val m = runCatching { estimator.finalizeStationary(c) }.getOrElse {
             status.text = "Segment closure failed: ${it.message}"
             return
         }
         status.text = String.format(
             Locale.US,
-            "Segment %d finalized: raw end speed %.3f m/s → constrained toward 0; tilt closure %.3f°; corrected segment distance %.1f m. New segment started.",
-            m.segmentId,
-            m.rawEndpointSpeed,
-            m.tiltClosureDeg,
-            m.correctedDistanceM
+            "Segment %d finalized · raw end speed %.3f m/s · tilt closure %.3f° · corrected distance %.1f m",
+            m.segmentId, m.rawEndpointSpeed, m.tiltClosureDeg, m.correctedDistanceM
         )
         refreshUi(estimator.state())
+        updateRouteView()
     }
 
     private fun cancelStopCapture() {
@@ -262,18 +269,16 @@ class MainActivity : Activity(), SensorEventListener {
         stationaryBtn.isEnabled = false
         exportBtn.isEnabled = true
         setSettingsEnabled(true)
-        status.text = "$reason. CSV contains finalized corrected segments plus any unfinished provisional segment."
+        status.text = "$reason. Finalized route remains on Route; CSV is ready in Settings."
+        updateRouteView()
     }
 
     private fun exportCsv() {
-        val src = completedCsv ?: run {
-            toast("No CSV")
-            return
-        }
+        val src = completedCsv ?: run { toast("No completed CSV"); return }
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "text/csv"
-            putExtra(Intent.EXTRA_TITLE, "railimu_v03_${System.currentTimeMillis()}.csv")
+            putExtra(Intent.EXTRA_TITLE, "railimu_v04_${System.currentTimeMillis()}.csv")
         }
         @Suppress("DEPRECATION")
         startActivityForResult(intent, 1001)
@@ -289,127 +294,170 @@ class MainActivity : Activity(), SensorEventListener {
             contentResolver.openOutputStream(uri)?.use { out ->
                 f.inputStream().use { input -> input.copyTo(out) }
             } ?: error("Could not open destination")
-        }.onSuccess {
-            toast("CSV exported")
-        }.onFailure {
-            toast("Export failed: ${it.message}")
-        }
+        }.onSuccess { toast("CSV exported") }
+            .onFailure { toast("Export failed: ${it.message}") }
     }
 
     private fun refreshUi(s: RailEstimator.State) {
+        speedHero.text = String.format(Locale.US, "%.1f km/h", s.speedMps * 3.6)
         val m = s.lastSegmentSummary
-        val suffix = if (m == null) {
-            ""
+        val closure = if (m == null) {
+            "No finalized stop-to-stop segment yet."
         } else {
             String.format(
                 Locale.US,
-                "\nlast closure: end %.3f m/s, tilt %.3f°, dist %.1f m",
-                m.rawEndpointSpeed,
-                m.tiltClosureDeg,
-                m.correctedDistanceM
+                "Last finalized: segment %d · %.1f m · endpoint drift %.3f m/s · tilt %.3f°",
+                m.segmentId, m.correctedDistanceM, m.rawEndpointSpeed, m.tiltClosureDeg
             )
         }
         live.text = String.format(
             Locale.US,
-            "segment %d   %s\nraw accel [%+.4f,%+.4f,%+.4f] m/s²\nraw gyro  [%+.5f,%+.5f,%+.5f] rad/s\n\nLIVE provisional:\na filt [%+.4f,%+.4f,%+.4f]\nv      [%+.4f,%+.4f,%+.4f] m/s\np      [%+.2f,%+.2f,%+.2f] m\nspeed  %.3f m/s (%.2f km/h)\ntime   %.1f s\n\nfinalized segments %d\ncorrected total distance %.1f m%s",
+            "Segment %d · %s\n\nAcceleration [%+.4f, %+.4f, %+.4f] m/s²\nVelocity     [%+.4f, %+.4f, %+.4f] m/s\nPosition     [%+.1f, %+.1f, %+.1f] m\nElapsed      %.1f s\n\nFinalized segments: %d\nCorrected distance: %.1f m\n%s",
             s.segmentId,
-            if (s.currentSegmentFinalized) "just finalized" else "open",
-            latestA.x,
-            latestA.y,
-            latestA.z,
-            latestW.x,
-            latestW.y,
-            latestW.z,
-            s.filteredAccelLocal.x,
-            s.filteredAccelLocal.y,
-            s.filteredAccelLocal.z,
-            s.velocityLocal.x,
-            s.velocityLocal.y,
-            s.velocityLocal.z,
-            s.positionLocal.x,
-            s.positionLocal.y,
-            s.positionLocal.z,
-            s.speedMps,
-            s.speedMps * 3.6,
-            s.elapsedSeconds,
+            if (s.currentSegmentFinalized) "just finalized" else "open / provisional",
+            s.filteredAccelLocal.x, s.filteredAccelLocal.y, s.filteredAccelLocal.z,
+            s.velocityLocal.x, s.velocityLocal.y, s.velocityLocal.z,
+            s.positionLocal.x, s.positionLocal.y, s.positionLocal.z,
+            s.elapsedSeconds, s.finalizedSegments, s.correctedTotalDistanceM, closure
+        )
+        updateRouteInfo(s)
+    }
+
+    private fun updateRouteInfo(s: RailEstimator.State = estimator.state()) {
+        routeInfo.text = String.format(
+            Locale.US,
+            "%d finalized segment(s) · %.1f m corrected distance\nBlue = finalized · orange dashed = current provisional segment",
             s.finalizedSegments,
-            s.correctedTotalDistanceM,
-            suffix
+            s.correctedTotalDistanceM
         )
     }
 
+    private fun updateRouteView() {
+        val gravity = estimator.calibration()?.measuredGravityVectorBody?.normalized() ?: Vec3(0.0, 0.0, 1.0)
+        trajectoryView.setData(estimator.exportSamples(), gravity)
+        updateRouteInfo()
+    }
+
+    private fun showPage(page: Int) {
+        currentPage = page
+        runPage.visibility = if (page == PAGE_RUN) View.VISIBLE else View.GONE
+        routePage.visibility = if (page == PAGE_ROUTE) View.VISIBLE else View.GONE
+        settingsPage.visibility = if (page == PAGE_SETTINGS) View.VISIBLE else View.GONE
+        runTab.isEnabled = page != PAGE_RUN
+        routeTab.isEnabled = page != PAGE_ROUTE
+        settingsTab.isEnabled = page != PAGE_SETTINGS
+        if (page == PAGE_ROUTE) updateRouteView()
+    }
+
     private fun buildUi() {
-        val density = resources.displayMetrics.density
-
-        fun dp(v: Int): Int = (v * density).toInt()
-
-        fun label(textValue: String, sp: Float = 14f): TextView {
-            return TextView(this).apply {
-                text = textValue
-                textSize = sp
-                setPadding(0, dp(4), 0, dp(4))
-            }
-        }
-
-        fun numberField(defaultValue: String): EditText {
-            return EditText(this).apply {
-                setText(defaultValue)
-                inputType = InputType.TYPE_CLASS_NUMBER or
-                    InputType.TYPE_NUMBER_FLAG_DECIMAL or
-                    InputType.TYPE_NUMBER_FLAG_SIGNED
-                isSingleLine = true
-            }
-        }
-
-        fun addParamRow(root: LinearLayout, name: String, field: EditText, hint: String) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            row.addView(
-                label(name, 13f),
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.35f)
-            )
-            row.addView(
-                field,
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.65f)
-            )
-            root.addView(row)
-            root.addView(label(hint, 11f))
-        }
-
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(18), dp(18), dp(28))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
         }
-        root.addView(label("Rail IMU v0.3", 28f))
-        root.addView(label("Stop-to-stop inertial estimation with retrospective drift closure", 14f))
-        status = label("Initializing…", 15f)
-        root.addView(status)
+        root.addView(makeLabel("Rail IMU v0.4", 24f))
 
-        calibrateBtn = Button(this).apply {
-            text = "CALIBRATE 5 S"
-            setOnClickListener { beginInitialCalibration() }
+        val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        runTab = Button(this).apply { text = "RUN"; setOnClickListener { showPage(PAGE_RUN) } }
+        routeTab = Button(this).apply { text = "ROUTE"; setOnClickListener { showPage(PAGE_ROUTE) } }
+        settingsTab = Button(this).apply { text = "SETTINGS"; setOnClickListener { showPage(PAGE_SETTINGS) } }
+        tabs.addView(runTab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        tabs.addView(routeTab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        tabs.addView(settingsTab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(tabs)
+
+        val host = FrameLayout(this)
+        runPage = buildRunPage()
+        routePage = buildRoutePage()
+        settingsPage = buildSettingsPage()
+        host.addView(runPage, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        host.addView(routePage, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        host.addView(settingsPage, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(host, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        setContentView(root)
+    }
+
+    private fun buildRunPage(): View {
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), dp(8), dp(6), dp(20))
         }
-        startBtn = Button(this).apply {
-            text = "START"
-            isEnabled = false
-            setOnClickListener { startMeasurement() }
+        status = makeLabel("Initializing…", 14f)
+        content.addView(status)
+        speedHero = makeLabel("0.0 km/h", 38f).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(14), 0, dp(14))
         }
-        stopBtn = Button(this).apply {
-            text = "STOP"
-            isEnabled = false
-            setOnClickListener { stopMeasurement() }
-        }
-        val controls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
+        content.addView(speedHero)
+
+        calibrateBtn = Button(this).apply { text = "CALIBRATE 5 S"; setOnClickListener { beginInitialCalibration() } }
+        startBtn = Button(this).apply { text = "START"; isEnabled = false; setOnClickListener { startMeasurement() } }
+        stopBtn = Button(this).apply { text = "STOP"; isEnabled = false; setOnClickListener { stopMeasurement() } }
+        val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         controls.addView(calibrateBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         controls.addView(startBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         controls.addView(stopBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        root.addView(controls)
+        content.addView(controls)
 
-        root.addView(label("Tuning parameters", 18f))
+        stationaryBtn = Button(this).apply {
+            text = "STATIONARY UPDATE · KNOWN STOP"
+            textSize = 16f
+            isEnabled = false
+            setOnClickListener { beginStationaryUpdate() }
+        }
+        content.addView(stationaryBtn)
+
+        live = makeLabel("No measurement", 14f).apply {
+            typeface = android.graphics.Typeface.MONOSPACE
+            setPadding(0, dp(12), 0, dp(8))
+        }
+        content.addView(live)
+        content.addView(makeLabel("Live values are provisional. A segment is corrected/finalized after a valid Stationary Update.", 11f))
+        return ScrollView(this).apply { addView(content) }
+    }
+
+    private fun buildRoutePage(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), dp(8), dp(6), dp(8))
+        }
+        routeInfo = makeLabel("No route yet", 13f)
+        root.addView(routeInfo)
+
+        trajectoryView = TrajectoryView(this)
+        val projections = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        projections.addView(projectionButton("TOP", TrajectoryView.Projection.HORIZONTAL), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        projections.addView(projectionButton("XY", TrajectoryView.Projection.XY), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        projections.addView(projectionButton("XZ", TrajectoryView.Projection.XZ), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        projections.addView(projectionButton("YZ", TrajectoryView.Projection.YZ), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(projections)
+        root.addView(trajectoryView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(
+            makeLabel(
+                "TOP projects the 3D trajectory onto the plane perpendicular to calibrated gravity. Phone mounting tilt therefore does not matter. The route is relative, not north-referenced; IMU-only yaw drift can slowly rotate or distort the plan view.",
+                11f
+            )
+        )
+        return root
+    }
+
+    private fun projectionButton(textValue: String, mode: TrajectoryView.Projection): Button {
+        return Button(this).apply {
+            text = textValue
+            textSize = 11f
+            setOnClickListener {
+                trajectoryView.projection = mode
+                updateRouteView()
+            }
+        }
+    }
+
+    private fun buildSettingsPage(): View {
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), dp(8), dp(6), dp(24))
+        }
+        content.addView(makeLabel("Estimator parameters", 19f))
+
         gEdit = numberField("9.80665").apply { isEnabled = false }
         cutoffEdit = numberField("1.0")
         stopWindowEdit = numberField("2.0")
@@ -419,44 +467,49 @@ class MainActivity : Activity(), SensorEventListener {
         tiltClosureEdit = numberField("1.0")
         endpointVelEdit = numberField("1.0")
 
-        addParamRow(root, "g used (m/s²)", gEdit, "Filled by calibration; editable.")
-        addParamRow(root, "LPF cutoff (Hz)", cutoffEdit, "2nd-order Butterworth, 0.05–20.")
-        addParamRow(root, "Stop window (s)", stopWindowEdit, "Stationary data collected after pressing update, 0.5–10.")
-        addParamRow(root, "Stop accel std max", accelStdEdit, "Reject stop update if 3D accel motion/noise exceeds this m/s².")
-        addParamRow(root, "Stop gyro std max", gyroStdEdit, "Reject stop update if 3D gyro variation exceeds this rad/s.")
-        addParamRow(root, "Gyro bias bridge", biasBridgeEdit, "0=no end-stop bias correction; 1=linear start→end bias drift model.")
-        addParamRow(root, "Tilt closure strength", tiltClosureEdit, "0=no endpoint gravity alignment; 1=full roll/pitch closure. Yaw is not forced.")
-        addParamRow(root, "Endpoint v correction", endpointVelEdit, "0=no v(T)=0 correction; 1=full linear velocity-drift closure.")
+        addParamRow(content, "g used (m/s²)", gEdit, "Filled by calibration; editable.")
+        addParamRow(content, "LPF cutoff (Hz)", cutoffEdit, "2nd-order Butterworth, 0.05–20 Hz.")
+        addParamRow(content, "Stop window (s)", stopWindowEdit, "Static capture duration after Stationary Update.")
+        addParamRow(content, "Stop accel std max", accelStdEdit, "Reject stop update above this 3D accel std (m/s²).")
+        addParamRow(content, "Stop gyro std max", gyroStdEdit, "Reject stop update above this 3D gyro std (rad/s).")
+        addParamRow(content, "Gyro bias bridge", biasBridgeEdit, "0 = off; 1 = linear start-stop → end-stop bias bridge.")
+        addParamRow(content, "Tilt closure strength", tiltClosureEdit, "0 = off; 1 = full endpoint gravity roll/pitch closure.")
+        addParamRow(content, "Endpoint v correction", endpointVelEdit, "0 = off; 1 = full v(T)=0 drift closure.")
 
-        calibrationInfo = label("Not calibrated", 13f)
-        root.addView(calibrationInfo)
-        live = label("No measurement", 15f).apply {
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        root.addView(live)
-
-        stationaryBtn = Button(this).apply {
-            text = "STATIONARY UPDATE (KNOWN STOP)"
-            isEnabled = false
-            setOnClickListener { beginStationaryUpdate() }
-        }
-        root.addView(stationaryBtn)
-
-        exportBtn = Button(this).apply {
-            text = "EXPORT CSV"
-            isEnabled = false
-            setOnClickListener { exportCsv() }
-        }
-        root.addView(exportBtn)
-
-        root.addView(
-            label(
-                "v0.3 principle: during motion, accelerometer is NOT used to continuously correct tilt, because train acceleration and tilt are not separable from accelerometer alone. At a known stop, the app gets a trustworthy endpoint: v=0, gravity direction, and gyro bias. It then replays the whole segment, bridges gyro bias from start stop to end stop, closes roll/pitch using endpoint gravity, and applies the v(T)=0 constraint. Live values can drift; finalized stop-to-stop results are the intended output.",
-                12f
-            )
-        )
-        setContentView(ScrollView(this).apply { addView(root) })
+        content.addView(makeLabel("Calibration", 19f))
+        calibrationInfo = makeLabel("Not calibrated", 13f)
+        content.addView(calibrationInfo)
+        exportBtn = Button(this).apply { text = "EXPORT CSV"; isEnabled = false; setOnClickListener { exportCsv() } }
+        content.addView(exportBtn)
+        content.addView(makeLabel("Parameters are locked while recording so the complete run uses one estimator configuration.", 11f))
+        return ScrollView(this).apply { addView(content) }
     }
+
+    private fun addParamRow(root: LinearLayout, name: String, field: EditText, hint: String) {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        row.addView(makeLabel(name, 13f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.35f))
+        row.addView(field, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.65f))
+        root.addView(row)
+        root.addView(makeLabel(hint, 11f))
+    }
+
+    private fun numberField(defaultValue: String): EditText {
+        return EditText(this).apply {
+            setText(defaultValue)
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
+            isSingleLine = true
+        }
+    }
+
+    private fun makeLabel(textValue: String, sp: Float = 14f): TextView {
+        return TextView(this).apply {
+            text = textValue
+            textSize = sp
+            setPadding(0, dp(4), 0, dp(4))
+        }
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     private fun setSettingsEnabled(enabled: Boolean) {
         gEdit.isEnabled = enabled && estimator.calibration() != null
@@ -470,4 +523,10 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+    companion object {
+        private const val PAGE_RUN = 0
+        private const val PAGE_ROUTE = 1
+        private const val PAGE_SETTINGS = 2
+    }
 }
