@@ -10,10 +10,20 @@ data class Vec3(val x: Double, val y: Double, val z: Double) {
     operator fun times(s: Double) = Vec3(x * s, y * s, z * s)
     operator fun div(s: Double) = Vec3(x / s, y / s, z / s)
     fun dot(o: Vec3) = x * o.x + y * o.y + z * o.z
+    fun cross(o: Vec3) = Vec3(
+        y * o.z - z * o.y,
+        z * o.x - x * o.z,
+        x * o.y - y * o.x
+    )
     fun norm() = sqrt(dot(this))
     fun normalized(): Vec3 {
         val n = norm()
         return if (n > 1e-12) this / n else ZERO
+    }
+    fun limited(maxNorm: Double): Vec3 {
+        if (maxNorm <= 0.0) return ZERO
+        val n = norm()
+        return if (n > maxNorm && n > 1e-12) this * (maxNorm / n) else this
     }
     companion object { val ZERO = Vec3(0.0, 0.0, 0.0) }
 }
@@ -30,6 +40,8 @@ data class Quaternion(val w: Double, val x: Double, val y: Double, val z: Double
         val n = sqrt(w*w + x*x + y*y + z*z)
         return if (n > 1e-12) Quaternion(w/n, x/n, y/n, z/n) else IDENTITY
     }
+
+    fun conjugate() = Quaternion(w, -x, -y, -z)
 
     fun rotate(v: Vec3): Vec3 {
         val tx = 2.0 * (y * v.z - z * v.y)
